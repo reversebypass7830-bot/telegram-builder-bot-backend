@@ -393,7 +393,9 @@ async function vercelRequest(route, method = 'GET', body) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error?.message || data.message || `Vercel request failed (${response.status}).`);
+    const error = new Error(data.error?.message || data.message || `Vercel request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -428,6 +430,40 @@ async function deployRepository(repository) {
     url: latest.url ? `https://${latest.url}` : deployment.url ? `https://${deployment.url}` : '',
     projectId: project.id || VERCEL_PROJECT_ID || '',
     deploymentId: latest.id || deployment.id || '',
+  };
+}
+
+async function deleteHostedResources({ vercelProjectId, repository }) {
+  const projectId = String(vercelProjectId || '').trim();
+  const repositorySlug = String(repository || '').trim();
+  if (!projectId && !repositorySlug) {
+    throw new Error('The product does not have enough saved metadata to delete its resources.');
+  }
+
+  if (projectId) {
+    try {
+      await vercelRequest(`/v9/projects/${encodeURIComponent(projectId)}`, 'DELETE');
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+  }
+
+  if (repositorySlug) {
+    const { owner, repo } = parseRepoSlug(repositorySlug);
+    try {
+      await githubRequest(
+        TARGET_TOKEN,
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+        { method: 'DELETE' },
+      );
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+  }
+
+  return {
+    vercelProjectDeleted: Boolean(projectId),
+    githubRepositoryDeleted: Boolean(repositorySlug),
   };
 }
 
@@ -577,6 +613,14 @@ async function handle(req, res) {
     jobs.set(job.id, job);
     void runBuild(job);
     return json(res, 202, { ok: true, build: publicJob(job) });
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/v1/products/delete') {
+    const result = await deleteHostedResources({
+      vercelProjectId: body.vercelProjectId,
+      repository: body.repository,
+    });
+    return json(res, 200, { ok: true, deleted: result });
   }
 
   const match = parsed.pathname.match(/^\/v1\/builds\/([^/]+)(\/deploy)?$/);
