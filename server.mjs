@@ -116,6 +116,26 @@ function updateJob(job, values) {
   Object.assign(job, values, { updatedAt: new Date().toISOString() });
 }
 
+function createJob(projectName, id = randomUUID()) {
+  return {
+    id,
+    projectName,
+    status: 'queued',
+    stage: 'queued',
+    configKeys: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function recoverJob(jobId, projectName) {
+  const normalizedProjectName = String(projectName || '').trim();
+  normalizeRepoName(normalizedProjectName);
+  const job = createJob(normalizedProjectName, jobId);
+  jobs.set(job.id, job);
+  return job;
+}
+
 function authOk(req) {
   const acceptedKeys = [API_KEY, TELEBOTHOST_API_KEY].filter(Boolean);
   if (!acceptedKeys.length) return false;
@@ -422,7 +442,15 @@ async function runBuild(job) {
 
 async function runDeployment(job, updates) {
   try {
-    updateJob(job, { status: 'deploying', stage: 'updating_repository' });
+    updateJob(job, { status: 'deploying', stage: job.repository ? 'updating_repository' : 'creating_repository' });
+    if (!job.repository) {
+      const repository = await createOrReuseRepository(job.projectName);
+      updateJob(job, {
+        repository,
+        configKeys: repository.configKeys,
+      });
+    }
+    updateJob(job, { stage: 'updating_repository' });
     await updateRepositoryConfig(job.repository, updates);
     updateJob(job, { stage: 'deploying' });
     const deploymentUrl = await deployRepository(job.repository);
@@ -537,15 +565,7 @@ async function handle(req, res) {
   if (req.method === 'POST' && parsed.pathname === '/v1/builds') {
     const projectName = String(body.projectName || '').trim();
     normalizeRepoName(projectName);
-    const job = {
-      id: randomUUID(),
-      projectName,
-      status: 'queued',
-      stage: 'queued',
-      configKeys: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+    const job = createJob(projectName);
     jobs.set(job.id, job);
     void runBuild(job);
     return json(res, 202, { ok: true, build: publicJob(job) });
@@ -553,13 +573,26 @@ async function handle(req, res) {
 
   const match = parsed.pathname.match(/^\/v1\/builds\/([^/]+)(\/deploy)?$/);
   if (req.method === 'GET' && match && !match[2]) {
-    const job = jobs.get(match[1]);
-    return job ? json(res, 200, { ok: true, build: publicJob(job) }) : json(res, 404, { ok: false, error: 'Build not found.' });
+    let job = jobs.get(match[1]);
+    if (!job) {
+      const projectName = parsed.searchParams.get('projectName');
+      if (!projectName) return json(res, 404, { ok: false, error: 'Build not found.' });
+      job = recoverJob(match[1], projectName);
+      void runBuild(job);
+      return json(res, 202, { ok: true, build: publicJob(job), recovered: true });
+    }
+    return json(res, 200, { ok: true, build: publicJob(job) });
   }
   if (req.method === 'POST' && match && match[2] === '/deploy') {
     const jobId = match[1];
-    const job = jobs.get(jobId);
-    if (!job) return json(res, 404, { ok: false, error: 'Build not found.' });
+    let job = jobs.get(jobId);
+    if (!job) {
+      const projectName = String(body.projectName || '').trim();
+      if (!projectName) return json(res, 404, { ok: false, error: 'Build not found.' });
+      job = recoverJob(jobId, projectName);
+      void runDeployment(job, body.updates || {});
+      return json(res, 202, { ok: true, build: publicJob(job), recovered: true });
+    }
     if (job.status !== 'ready' || job.stage !== 'awaiting_configuration') {
       return json(res, 409, { ok: false, error: `Build is not ready for deployment (${job.status}/${job.stage}).` });
     }
