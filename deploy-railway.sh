@@ -11,10 +11,32 @@ if ! railway status >/dev/null 2>&1; then
   exit 1
 fi
 
-backend_key="${BUILDER_BACKEND_API_KEY:-${SESSION_SECRET:-}}"
-source_token="${BUILDER_GITHUB_SOURCE_TOKEN:-}"
-target_token="${BUILDER_GITHUB_TARGET_TOKEN:-}"
-vercel_token="${BUILDER_VERCEL_TOKEN:-}"
+config_file="${BUILDER_CONFIG_FILE:-../config.txt}"
+config_value() {
+  if [ ! -f "$config_file" ]; then
+    return 0
+  fi
+  node --input-type=module - "$config_file" "$1" <<'NODE'
+import { readFileSync } from 'node:fs';
+const [file, key] = process.argv.slice(2);
+const text = readFileSync(file, 'utf8');
+const line = text.split(/\r?\n/).find((item) => item.trim().startsWith(`${key}=`));
+if (!line) process.exit(0);
+let value = line.slice(line.indexOf('=') + 1).trim();
+if (
+  value.length >= 2 &&
+  ((value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'")))
+) value = value.slice(1, -1);
+process.stdout.write(value);
+NODE
+}
+
+backend_key="${BUILDER_BACKEND_API_KEY:-${SESSION_SECRET:-$(config_value BUILDER_BACKEND_API_KEY)}}"
+backend_key="${backend_key:-$(config_value Secret_key)}"
+source_token="${BUILDER_GITHUB_SOURCE_TOKEN:-$(config_value BUILDER_GITHUB_SOURCE_TOKEN)}"
+target_token="${BUILDER_GITHUB_TARGET_TOKEN:-$(config_value BUILDER_GITHUB_TARGET_TOKEN)}"
+vercel_token="${BUILDER_VERCEL_TOKEN:-$(config_value BUILDER_VERCEL_TOKEN)}"
 
 for pair in \
   "BUILDER_BACKEND_API_KEY:${backend_key}" \
