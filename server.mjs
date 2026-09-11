@@ -440,24 +440,34 @@ async function updateDiscoveryFile() {
   const endpoint = publicBaseUrl();
   if (!endpoint || !TARGET_TOKEN) return;
   const { owner, repo } = parseRepoSlug(BACKEND_REPO);
-  const filePath = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${DISCOVERY_FILE}`;
   let current = {};
   try {
     const currentResponse = await githubRequest(TARGET_TOKEN, `/repos/${owner}/${repo}/contents/${DISCOVERY_FILE}`);
-    current = { sha: currentResponse.sha };
+    let document = {};
+    try {
+      document = JSON.parse(decodeContent(currentResponse.content));
+    } catch {
+      document = {};
+    }
+    current = { sha: currentResponse.sha, document };
   } catch (error) {
     if (error.status !== 404) throw error;
+  }
+  const provider = providerName();
+  if (current.document?.url === endpoint && current.document?.provider === provider) {
+    console.log('[backend] discovery file is already current; skipping GitHub commit.');
+    return;
   }
   const document = {
     url: endpoint,
     version: 1,
     updatedAt: new Date().toISOString(),
-    provider: providerName(),
+    provider,
   };
   await githubRequest(TARGET_TOKEN, `/repos/${owner}/${repo}/contents/${DISCOVERY_FILE}`, {
     method: 'PUT',
     body: JSON.stringify({
-      message: `Update backend endpoint for ${providerName() || 'host'}`,
+      message: `Update backend endpoint for ${provider || 'host'}`,
       content: encodeContent(`${JSON.stringify(document, null, 2)}\n`),
       ...(current.sha ? { sha: current.sha } : {}),
       branch: 'main',
