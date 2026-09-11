@@ -117,10 +117,11 @@ function updateJob(job, values) {
 }
 
 function authOk(req) {
-  if (!API_KEY) return false;
+  const acceptedKeys = [API_KEY, TELEBOTHOST_API_KEY].filter(Boolean);
+  if (!acceptedKeys.length) return false;
   const provided = String(req.headers['x-backend-key'] || '').trim();
   const authorization = String(req.headers.authorization || '');
-  return provided === API_KEY || authorization === `Bearer ${API_KEY}`;
+  return acceptedKeys.some((key) => provided === key || authorization === `Bearer ${key}`);
 }
 
 async function githubRequest(token, route, options = {}) {
