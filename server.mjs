@@ -23,6 +23,16 @@ const BACKEND_REPO = String(
 const DISCOVERY_FILE = String(
   process.env.BUILDER_BACKEND_DISCOVERY_FILE || 'backend-endpoint.json',
 ).trim();
+const TELEBOTHOST_API_BASE = String(
+  process.env.BUILDER_TELEBOTHOST_API_BASE || 'https://api.telebothost.com/api/v1',
+).replace(/\/+$/, '');
+const TELEBOTHOST_API_KEY = String(process.env.BUILDER_TELEBOTHOST_API_KEY || '').trim();
+const TELEBOTHOST_BOT_ID = String(
+  process.env.BUILDER_TELEBOTHOST_BOT_ID || '377965775095836',
+).trim();
+const TELEBOTHOST_ENV_NAME = String(
+  process.env.BUILDER_TELEBOTHOST_ENV_NAME || 'BUILDER_BACKEND_URL',
+).trim();
 
 const jobs = new Map();
 
@@ -139,6 +149,43 @@ async function githubRequest(token, route, options = {}) {
     throw error;
   }
   return body;
+}
+
+async function teleBotHostRequest(route, options = {}) {
+  if (!TELEBOTHOST_API_KEY) {
+    throw new Error('BUILDER_TELEBOTHOST_API_KEY is not configured.');
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(`${TELEBOTHOST_API_BASE}${route}`, {
+      ...options,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Api-Key': TELEBOTHOST_API_KEY,
+        ...(options.headers || {}),
+      },
+    });
+    const text = await response.text();
+    let body = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = { message: text.slice(0, 300) };
+    }
+
+    if (response.ok && body?.success !== false) return body;
+    if (response.status === 429 && attempt < 2) {
+      const retryAfter = Number(response.headers.get('retry-after') || 10);
+      await new Promise((resolve) => setTimeout(resolve, Math.max(5, retryAfter) * 1000));
+      continue;
+    }
+
+    const reason = body?.reason || body?.message || `TeleBotHost request failed (${response.status}).`;
+    throw new Error(String(reason).slice(0, 300));
+  }
+
+  throw new Error('TeleBotHost request quota retry limit reached.');
 }
 
 function decodeContent(content) {
@@ -412,6 +459,40 @@ async function updateDiscoveryFile() {
   });
 }
 
+async function updateTeleBotHostEnvironment(endpoint) {
+  if (!endpoint) return;
+  if (!TELEBOTHOST_API_KEY) {
+    console.log('[backend] TeleBotHost URL sync skipped: API key is not configured.');
+    return;
+  }
+
+  const current = await teleBotHostRequest(`/bot/${encodeURIComponent(TELEBOTHOST_BOT_ID)}/envs`);
+  const environments = Array.isArray(current.envs) ? current.envs : [];
+  const existing = environments.find((item) => item.name === TELEBOTHOST_ENV_NAME);
+  const body = { value: endpoint };
+
+  if (existing?.id) {
+    await teleBotHostRequest(
+      `/bot/${encodeURIComponent(TELEBOTHOST_BOT_ID)}/envs/${encodeURIComponent(existing.id)}`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    );
+  } else {
+    await teleBotHostRequest(
+      `/bot/${encodeURIComponent(TELEBOTHOST_BOT_ID)}/envs`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: TELEBOTHOST_ENV_NAME,
+          ...body,
+          placeholder: 'Builder backend public URL',
+        }),
+      },
+    );
+  }
+
+  console.log(`[backend] TeleBotHost environment updated: ${TELEBOTHOST_ENV_NAME}`);
+}
+
 async function handle(req, res) {
   const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'GET' && parsed.pathname === '/health') {
@@ -484,7 +565,11 @@ const server = await import('node:http').then(({ createServer }) =>
 
 server.listen(PORT, HOST, () => {
   console.log(`Builder backend listening on ${HOST}:${PORT}`);
+  const endpoint = publicBaseUrl();
   void updateDiscoveryFile().catch((error) => {
     console.error(`[backend] discovery update failed: ${safeError(error)}`);
+  });
+  void updateTeleBotHostEnvironment(endpoint).catch((error) => {
+    console.error(`[backend] TeleBotHost URL sync failed: ${safeError(error)}`);
   });
 });

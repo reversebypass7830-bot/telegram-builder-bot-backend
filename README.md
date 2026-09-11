@@ -23,6 +23,8 @@ Set these in Railway or another host:
 - `BUILDER_SOURCE_REPO`
 - `BUILDER_SOURCE_BRANCH`
 - `BUILDER_VERCEL_TOKEN`
+- `BUILDER_TELEBOTHOST_API_KEY` — TeleBotHost developer API key used to update
+  the Builder Bot backend URL environment variable at startup
 
 Optional:
 
@@ -31,6 +33,14 @@ Optional:
 - `BACKEND_PUBLIC_URL` — only needed when the host does not expose a public
   domain variable. Railway is detected automatically through
   `RAILWAY_PUBLIC_DOMAIN`.
+- `BUILDER_TELEBOTHOST_BOT_ID` — defaults to the `sellingmaker` bot
+  (`377965775095836`)
+- `BUILDER_TELEBOTHOST_ENV_NAME` — defaults to `BUILDER_BACKEND_URL`
+- `BUILDER_TELEBOTHOST_API_BASE` — defaults to the TeleBotHost developer API
+
+When the service starts, it updates `BUILDER_BACKEND_URL` directly in the
+TeleBotHost bot environment. The Builder Bot reads this value first and only
+uses the GitHub discovery file as a fallback.
 
 The target GitHub token needs repository-create and contents-write permission.
 The source token needs read access to the private source repository.

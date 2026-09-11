@@ -37,6 +37,8 @@ backend_key="${backend_key:-$(config_value Secret_key)}"
 source_token="${BUILDER_GITHUB_SOURCE_TOKEN:-$(config_value BUILDER_GITHUB_SOURCE_TOKEN)}"
 target_token="${BUILDER_GITHUB_TARGET_TOKEN:-$(config_value BUILDER_GITHUB_TARGET_TOKEN)}"
 vercel_token="${BUILDER_VERCEL_TOKEN:-$(config_value BUILDER_VERCEL_TOKEN)}"
+telebothost_key="${BUILDER_TELEBOTHOST_API_KEY:-$(config_value BUILDER_TELEBOTHOST_API_KEY)}"
+telebothost_key="${telebothost_key:-$(config_value Secret_key)}"
 
 for pair in \
   "BUILDER_BACKEND_API_KEY:${backend_key}" \
@@ -57,5 +59,15 @@ railway variables set \
   BUILDER_SOURCE_BRANCH="${BUILDER_SOURCE_BRANCH:-main}" \
   BUILDER_BACKEND_REPO="${BUILDER_BACKEND_REPO:-reversebypass7830-bot/telegram-builder-bot-backend}" \
   BUILDER_BACKEND_DISCOVERY_FILE="${BUILDER_BACKEND_DISCOVERY_FILE:-backend-endpoint.json}" >/dev/null
+
+if [ -n "$telebothost_key" ]; then
+  railway variables set \
+    "BUILDER_TELEBOTHOST_API_KEY=$telebothost_key" \
+    "BUILDER_TELEBOTHOST_BOT_ID=${BUILDER_TELEBOTHOST_BOT_ID:-377965775095836}" \
+    "BUILDER_TELEBOTHOST_ENV_NAME=${BUILDER_TELEBOTHOST_ENV_NAME:-BUILDER_BACKEND_URL}" \
+    "BUILDER_TELEBOTHOST_API_BASE=${BUILDER_TELEBOTHOST_API_BASE:-https://api.telebothost.com/api/v1}" >/dev/null
+else
+  echo "BUILDER_TELEBOTHOST_API_KEY is missing; direct TeleBotHost URL sync will be skipped."
+fi
 
 railway up --detach
