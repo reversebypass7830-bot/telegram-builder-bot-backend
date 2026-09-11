@@ -107,6 +107,8 @@ function publicJob(job) {
     repository: job.repository || null,
     configKeys: job.configKeys || [],
     deploymentUrl: job.deploymentUrl || null,
+    vercelProjectId: job.vercelProjectId || null,
+    vercelDeploymentId: job.vercelDeploymentId || null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -422,7 +424,11 @@ async function deployRepository(repository) {
   if (latest.readyState !== 'READY') {
     throw new Error(latest.errorMessage || `Vercel deployment ended in ${latest.readyState || 'failed'} state.`);
   }
-  return latest.url ? `https://${latest.url}` : deployment.url ? `https://${deployment.url}` : '';
+  return {
+    url: latest.url ? `https://${latest.url}` : deployment.url ? `https://${deployment.url}` : '',
+    projectId: project.id || VERCEL_PROJECT_ID || '',
+    deploymentId: latest.id || deployment.id || '',
+  };
 }
 
 async function runBuild(job) {
@@ -453,11 +459,13 @@ async function runDeployment(job, updates) {
     updateJob(job, { stage: 'updating_repository' });
     await updateRepositoryConfig(job.repository, updates);
     updateJob(job, { stage: 'deploying' });
-    const deploymentUrl = await deployRepository(job.repository);
+    const deployment = await deployRepository(job.repository);
     updateJob(job, {
       status: 'ready',
       stage: 'complete',
-      deploymentUrl,
+      deploymentUrl: deployment.url,
+      vercelProjectId: deployment.projectId,
+      vercelDeploymentId: deployment.deploymentId,
     });
   } catch (error) {
     updateJob(job, { status: 'failed', stage: 'failed', error: safeError(error) });
