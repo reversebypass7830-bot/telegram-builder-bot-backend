@@ -325,6 +325,7 @@ async function createOrReuseRepository(projectName) {
   return {
     owner,
     repo,
+    repoId: repository.id,
     branch,
     htmlUrl: repository.html_url || `https://github.com/${owner}/${repo}`,
     creationMode,
@@ -375,6 +376,10 @@ async function vercelRequest(route, method = 'GET', body) {
 }
 
 async function deployRepository(repository) {
+  const repoId = String(repository.repoId || '').trim();
+  if (!repoId) {
+    throw new Error('The GitHub repository ID is missing, so Vercel cannot start the deployment.');
+  }
   const project = VERCEL_PROJECT_ID
     ? await vercelRequest(`/v9/projects/${encodeURIComponent(VERCEL_PROJECT_ID)}`)
     : await vercelRequest('/v9/projects', 'POST', {
@@ -385,7 +390,7 @@ async function deployRepository(repository) {
     name: repository.repo,
     project: project.id || VERCEL_PROJECT_ID,
     target: 'production',
-    gitSource: { type: 'github', repo: `${repository.owner}/${repository.repo}`, ref: repository.branch },
+    gitSource: { type: 'github', repoId, ref: repository.branch },
   });
   let latest = deployment;
   for (let attempt = 0; attempt < 30; attempt += 1) {
