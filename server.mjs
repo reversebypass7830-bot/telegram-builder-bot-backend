@@ -436,8 +436,8 @@ async function deployRepository(repository) {
 async function deleteHostedResources({ vercelProjectId, repository }) {
   const projectId = String(vercelProjectId || '').trim();
   const repositorySlug = String(repository || '').trim();
-  if (!projectId && !repositorySlug) {
-    throw new Error('The product does not have enough saved metadata to delete its resources.');
+  if (!projectId || !repositorySlug) {
+    throw new Error('The product is missing its Vercel project or repository metadata. Rebuild it before deleting.');
   }
 
   if (projectId) {
