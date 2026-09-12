@@ -509,16 +509,16 @@ async function syncRepositoryWithSource(repository, sourceSnapshot, configValues
       env: { ...process.env, ...gitAuthEnvironment(SOURCE_TOKEN) },
       maxBuffer: 1024 * 1024 * 8,
     });
-    await execFileAsync('git', ['branch', backupRef, 'HEAD'], { cwd: worktree });
-    await execFileAsync('git', ['push', 'origin', `${backupRef}:${backupRef}`], {
-      cwd: worktree,
-      env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
-    });
     await execFileAsync(
       'git',
       ['read-tree', '--reset', '-u', `source/${SOURCE_BRANCH}`],
       { cwd: worktree },
     );
+    await execFileAsync('git', ['branch', backupRef, 'HEAD'], { cwd: worktree });
+    await execFileAsync('git', ['push', 'origin', `${backupRef}:${backupRef}`], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+    });
 
     const sourceConfigPath = path.join(worktree, 'config.txt');
     const sourceConfig = await readFile(sourceConfigPath, 'utf8').catch(() => sourceSnapshot.configText);
