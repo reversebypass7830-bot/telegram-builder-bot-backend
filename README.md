@@ -17,6 +17,8 @@ that is too slow or restricted for TeleBotHost TBL commands.
 
 Set these in Railway or another host:
 
+- `BUILDER_BOT_TELEGRAM_TOKEN` — used only to download uploaded config files and
+  send automatic update notifications
 - `BUILDER_BACKEND_API_KEY`
 - `BUILDER_GITHUB_SOURCE_TOKEN`
 - `BUILDER_GITHUB_TARGET_TOKEN`
@@ -25,6 +27,9 @@ Set these in Railway or another host:
 - `BUILDER_VERCEL_TOKEN`
 - `BUILDER_TELEBOTHOST_API_KEY` — TeleBotHost developer API key used to update
   the Builder Bot backend URL environment variable at startup
+
+The Telegram token is never printed or returned by the service. It is required
+for automatic update notifications and for reading a document sent to the bot.
 
 Optional:
 

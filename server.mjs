@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -33,8 +33,17 @@ const TELEBOTHOST_BOT_ID = String(
 const TELEBOTHOST_ENV_NAME = String(
   process.env.BUILDER_TELEBOTHOST_ENV_NAME || 'BUILDER_BACKEND_URL',
 ).trim();
+const TELEGRAM_BOT_TOKEN = String(process.env.BUILDER_BOT_TELEGRAM_TOKEN || '').trim();
+const SUBSCRIPTIONS_FILE = String(
+  process.env.BUILDER_SUBSCRIPTIONS_FILE || path.join(os.tmpdir(), 'builder-product-subscriptions.json'),
+).trim();
+const UPDATE_POLL_MS = Math.max(60_000, Number(process.env.BUILDER_UPDATE_POLL_MS || 300_000));
 
 const jobs = new Map();
+const productJobs = new Map();
+const subscriptions = new Map();
+let subscriptionsLoaded = false;
+let updatePollRunning = false;
 
 function parseRepoSlug(value) {
   const normalized = String(value || '')
@@ -248,6 +257,193 @@ function applyConfigUpdates(text, updates) {
   return lines.join('\n');
 }
 
+function configEntries(text) {
+  const entries = new Map();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$/);
+    if (match) entries.set(match[1], match[2].trim());
+  }
+  return entries;
+}
+
+function configKeysFrom(text) {
+  return [...configEntries(text).keys()];
+}
+
+function mergeConfigValues(sourceText, targetText, excludedKeys = []) {
+  const preserved = configEntries(targetText);
+  const sourceKeys = new Set(configEntries(sourceText).keys());
+  const excluded = new Set(excludedKeys);
+  const updates = {};
+  for (const [key, value] of preserved.entries()) {
+    if (sourceKeys.has(key) && !excluded.has(key)) updates[key] = value;
+  }
+  return applyConfigUpdates(sourceText, updates);
+}
+
+function removeConfigKeys(text, keys) {
+  const excluded = new Set(keys);
+  return String(text || '')
+    .split(/\r?\n/)
+    .filter((line) => {
+      const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*=/);
+      return !match || !excluded.has(match[1]);
+    })
+    .join('\n');
+}
+
+async function readSourceSnapshot() {
+  const source = parseRepoSlug(SOURCE_REPO);
+  const ref = await githubRequest(
+    SOURCE_TOKEN,
+    `/repos/${encodeURIComponent(source.owner)}/${encodeURIComponent(source.repo)}/git/ref/heads/${encodeURIComponent(SOURCE_BRANCH)}`,
+  );
+  const config = await readConfig(SOURCE_TOKEN, source.owner, source.repo, SOURCE_BRANCH);
+  return {
+    sha: ref.object?.sha || '',
+    configText: config.text,
+    configKeys: configKeysFrom(config.text),
+    owner: source.owner,
+    repo: source.repo,
+    branch: SOURCE_BRANCH,
+  };
+}
+
+async function readTelegramDocument(fileId) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error('BUILDER_BOT_TELEGRAM_TOKEN is not configured on the backend.');
+  }
+  const fileResponse = await fetch(
+    `https://api.telegram.org/bot${encodeURIComponent(TELEGRAM_BOT_TOKEN)}/getFile`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_id: String(fileId || '') }),
+    },
+  );
+  const fileBody = await fileResponse.json().catch(() => ({}));
+  if (!fileResponse.ok || !fileBody.ok || !fileBody.result?.file_path) {
+    throw new Error(fileBody.description || 'Telegram file could not be read.');
+  }
+  const contentResponse = await fetch(
+    `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileBody.result.file_path}`,
+  );
+  if (!contentResponse.ok) throw new Error(`Telegram file download failed (${contentResponse.status}).`);
+  return contentResponse.text();
+}
+
+function parseConfigUpload(text) {
+  const updates = {};
+  const invalid = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) {
+      invalid.push(trimmed.slice(0, 80));
+      continue;
+    }
+    const key = trimmed.slice(0, separator).trim();
+    const value = trimmed.slice(separator + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key)) {
+      invalid.push(key.slice(0, 80));
+      continue;
+    }
+    updates[key] = value;
+  }
+  if (!Object.keys(updates).length) throw new Error('The uploaded file did not contain any valid KEY=value lines.');
+  return { updates, invalid };
+}
+
+function subscriptionId(body) {
+  const repo = String(body.repository || '').trim();
+  const userId = String(body.userId || '').trim();
+  if (!repo || !userId) throw new Error('Product repository and user ID are required.');
+  return `${userId}:${repo.toLowerCase()}`;
+}
+
+function publicSubscription(subscription) {
+  return {
+    id: subscription.id,
+    userId: subscription.userId,
+    chatId: subscription.chatId,
+    projectName: subscription.projectName,
+    repository: subscription.repository,
+    branch: subscription.branch,
+    autoUpdate: Boolean(subscription.autoUpdate),
+    sourceSha: subscription.sourceSha || null,
+    lastAppliedAt: subscription.lastAppliedAt || null,
+    scheduledFor: subscription.scheduledFor || null,
+    pendingConfigKeys: subscription.pendingConfigKeys || [],
+    lastError: subscription.lastError || null,
+    backupRef: subscription.backupRef || null,
+  };
+}
+
+async function loadSubscriptions() {
+  if (subscriptionsLoaded) return;
+  subscriptionsLoaded = true;
+  try {
+    const content = await readFile(SUBSCRIPTIONS_FILE, 'utf8');
+    const data = JSON.parse(content);
+    for (const item of Array.isArray(data) ? data : []) {
+      if (item?.id) subscriptions.set(item.id, item);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error(`[backend] subscription state load failed: ${safeError(error)}`);
+  }
+}
+
+async function saveSubscriptions() {
+  await writeFile(SUBSCRIPTIONS_FILE, JSON.stringify([...subscriptions.values()], null, 2));
+}
+
+function telegramButtonStyle(text) {
+  const label = String(text || '').trim();
+  if (/^(Cancel|Delete Product|Confirm Delete|Pause Website|Reject\b|Revert Last Update)/i.test(label)) {
+    return 'danger';
+  }
+  if (/^(Approve\b|DONE$|Update Now$|Add Now$|I have paid$|Resume Website$)/i.test(label)) {
+    return 'success';
+  }
+  return 'primary';
+}
+
+function styledTelegramKeyboard(rows) {
+  return rows.map((row) =>
+    row.map((button) => {
+      const text = typeof button === 'string' ? button : String(button?.text || '');
+      return {
+        ...(typeof button === 'object' && button ? button : {}),
+        text,
+        style: button?.style || telegramButtonStyle(text),
+      };
+    }),
+  );
+}
+
+async function telegramSend(chatId, text, rows = []) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return false;
+  const body = { chat_id: String(chatId), text: String(text) };
+  if (rows.length) {
+    body.reply_markup = {
+      keyboard: styledTelegramKeyboard(rows),
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    };
+  }
+  const response = await fetch(
+    `https://api.telegram.org/bot${encodeURIComponent(TELEGRAM_BOT_TOKEN)}/sendMessage`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) throw new Error(`Telegram notification failed (${response.status}).`);
+  return true;
+}
+
 function gitAuthEnvironment(token) {
   return {
     GIT_CONFIG_COUNT: '1',
@@ -277,6 +473,122 @@ async function mirrorRepository(sourceToken, targetToken, sourceRepo, targetOwne
   } catch (error) {
     const detail = error?.stderr || error?.message || 'mirror operation failed';
     throw new Error(`Repository mirror failed: ${String(detail).slice(-800)}`);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function syncRepositoryWithSource(repository, sourceSnapshot, configValues = {}) {
+  const tempRoot = path.join(os.tmpdir(), `builder-update-${randomUUID()}`);
+  const worktree = path.join(tempRoot, 'target');
+  const source = parseRepoSlug(SOURCE_REPO);
+  const targetUrl = `https://github.com/${repository.owner}/${repository.repo}.git`;
+  const sourceUrl = `https://github.com/${source.owner}/${source.repo}.git`;
+  await mkdir(tempRoot, { recursive: true });
+
+  try {
+    await execFileAsync(
+      'git',
+      ['clone', '--branch', repository.branch, '--single-branch', targetUrl, worktree],
+      {
+        cwd: tempRoot,
+        env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+        maxBuffer: 1024 * 1024 * 8,
+      },
+    );
+    const currentConfig = await readFile(path.join(worktree, 'config.txt'), 'utf8').catch(() => '');
+    const { stdout: previousSha } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+    const backupRef = `builder-backup-${Date.now()}`;
+
+    await execFileAsync('git', ['remote', 'add', 'source', sourceUrl], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(SOURCE_TOKEN) },
+    });
+    await execFileAsync('git', ['fetch', 'source', SOURCE_BRANCH], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(SOURCE_TOKEN) },
+      maxBuffer: 1024 * 1024 * 8,
+    });
+    await execFileAsync('git', ['branch', backupRef, 'HEAD'], { cwd: worktree });
+    await execFileAsync('git', ['push', 'origin', `${backupRef}:${backupRef}`], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+    });
+    await execFileAsync('git', ['read-tree', '-u', `source/${SOURCE_BRANCH}`], { cwd: worktree });
+
+    const sourceConfigPath = path.join(worktree, 'config.txt');
+    const sourceConfig = await readFile(sourceConfigPath, 'utf8').catch(() => sourceSnapshot.configText);
+    const oldKeys = new Set(configKeysFrom(currentConfig));
+    const sourceKeys = new Set(configKeysFrom(sourceConfig));
+    const newKeys = [...sourceKeys].filter((key) => !oldKeys.has(key));
+    let mergedConfig = mergeConfigValues(sourceConfig, currentConfig, newKeys);
+    mergedConfig = applyConfigUpdates(mergedConfig, configValues);
+    await writeFile(sourceConfigPath, mergedConfig);
+
+    await execFileAsync('git', ['config', 'user.email', 'builder-bot@users.noreply.github.com'], { cwd: worktree });
+    await execFileAsync('git', ['config', 'user.name', 'Telegram Builder Bot'], { cwd: worktree });
+    await execFileAsync('git', ['add', '-A'], { cwd: worktree });
+    let newSha = previousSha;
+    const stagedStatus = await execFileAsync(
+      'git',
+      ['diff', '--cached', '--quiet'],
+      { cwd: worktree },
+    ).then(() => 0).catch((error) => Number(error.code) || 1);
+    if (stagedStatus !== 0) {
+      await execFileAsync(
+        'git',
+        ['commit', '-m', `Sync source ${String(sourceSnapshot.sha || '').slice(0, 12)}`],
+        { cwd: worktree },
+      );
+      const result = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      newSha = result.stdout;
+    }
+    await execFileAsync('git', ['push', 'origin', `HEAD:${repository.branch}`], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+      maxBuffer: 1024 * 1024 * 8,
+    });
+
+    return {
+      previousSha: previousSha.trim(),
+      newSha: String(newSha).trim(),
+      backupRef,
+      newKeys,
+      configText: mergedConfig,
+    };
+  } catch (error) {
+    const detail = error?.stderr || error?.message || 'source update failed';
+    throw new Error(`Source update failed: ${String(detail).slice(-800)}`);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function revertRepository(repository, backupRef) {
+  const tempRoot = path.join(os.tmpdir(), `builder-revert-${randomUUID()}`);
+  const worktree = path.join(tempRoot, 'target');
+  const targetUrl = `https://github.com/${repository.owner}/${repository.repo}.git`;
+  await mkdir(tempRoot, { recursive: true });
+  try {
+    await execFileAsync(
+      'git',
+      ['clone', '--branch', backupRef, '--single-branch', targetUrl, worktree],
+      {
+        cwd: tempRoot,
+        env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+        maxBuffer: 1024 * 1024 * 8,
+      },
+    );
+    await execFileAsync('git', ['push', '--force', 'origin', `HEAD:${repository.branch}`], {
+      cwd: worktree,
+      env: { ...process.env, ...gitAuthEnvironment(TARGET_TOKEN) },
+      maxBuffer: 1024 * 1024 * 8,
+    });
+    const { stdout: sha } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+    return { sha: sha.trim() };
+  } catch (error) {
+    const detail = error?.stderr || error?.message || 'rollback failed';
+    throw new Error(`Rollback failed: ${String(detail).slice(-800)}`);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -405,15 +717,16 @@ async function deployRepository(repository) {
   if (!repoId) {
     throw new Error('The GitHub repository ID is missing, so Vercel cannot start the deployment.');
   }
-  const project = VERCEL_PROJECT_ID
-    ? await vercelRequest(`/v9/projects/${encodeURIComponent(VERCEL_PROJECT_ID)}`)
+  const configuredProjectId = String(repository.vercelProjectId || VERCEL_PROJECT_ID || '').trim();
+  const project = configuredProjectId
+    ? await vercelRequest(`/v9/projects/${encodeURIComponent(configuredProjectId)}`)
     : await vercelRequest('/v9/projects', 'POST', {
         name: repository.repo,
         gitRepository: { type: 'github', repo: `${repository.owner}/${repository.repo}` },
       });
   const deployment = await vercelRequest('/v13/deployments', 'POST', {
     name: repository.repo,
-    project: project.id || VERCEL_PROJECT_ID,
+    project: project.id || configuredProjectId,
     target: 'production',
     gitSource: { type: 'github', repoId, ref: repository.branch },
   });
@@ -428,9 +741,200 @@ async function deployRepository(repository) {
   }
   return {
     url: latest.url ? `https://${latest.url}` : deployment.url ? `https://${deployment.url}` : '',
-    projectId: project.id || VERCEL_PROJECT_ID || '',
+    projectId: project.id || configuredProjectId || '',
     deploymentId: latest.id || deployment.id || '',
   };
+}
+
+async function ensureSubscriptionRepository(subscription) {
+  const parsed = parseRepoSlug(subscription.repository);
+  const details = await githubRequest(
+    TARGET_TOKEN,
+    `/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`,
+  );
+  subscription.repository = `${details.owner?.login || parsed.owner}/${details.name || parsed.repo}`;
+  subscription.owner = details.owner?.login || parsed.owner;
+  subscription.repo = details.name || parsed.repo;
+  subscription.repoId = details.id || subscription.repoId;
+  subscription.branch = subscription.branch || details.default_branch || SOURCE_BRANCH;
+  subscription.htmlUrl = details.html_url || subscription.htmlUrl;
+  return subscription;
+}
+
+async function productUpdate(subscription, options = {}) {
+  await ensureSubscriptionRepository(subscription);
+  const source = await readSourceSnapshot();
+  const previousSourceSha = subscription.sourceSha || '';
+  const currentTarget = await readConfig(
+    TARGET_TOKEN,
+    subscription.owner,
+    subscription.repo,
+    subscription.branch,
+  );
+  const targetKeys = new Set(configKeysFrom(currentTarget.text));
+  const newKeys = source.configKeys.filter((key) => !targetKeys.has(key));
+  const requestedValues = { ...(options.configValues || {}) };
+  if (options.addNewKeys) {
+    const sourceValues = configEntries(source.configText);
+    for (const key of newKeys) {
+      if (requestedValues[key] === undefined) requestedValues[key] = sourceValues.get(key) || '';
+    }
+  }
+
+  const repository = {
+    owner: subscription.owner,
+    repo: subscription.repo,
+    repoId: subscription.repoId,
+    branch: subscription.branch,
+    htmlUrl: subscription.htmlUrl,
+    vercelProjectId: subscription.vercelProjectId,
+  };
+  const sync = await syncRepositoryWithSource(repository, source, requestedValues);
+  const deployment = await deployRepository(repository);
+  subscription.sourceSha = source.sha;
+  subscription.lastAppliedAt = new Date().toISOString();
+  subscription.pendingConfigKeys = options.addNewKeys ? [] : sync.newKeys;
+  subscription.backupRef = sync.backupRef;
+  subscription.previousSha = sync.previousSha;
+  subscription.lastError = '';
+  subscription.lastReason = options.reason || 'manual';
+  subscription.vercelProjectId = deployment.projectId || subscription.vercelProjectId || '';
+  subscription.vercelDeploymentId = deployment.deploymentId || '';
+  subscription.lastDeploymentUrl = deployment.url || subscription.lastDeploymentUrl || '';
+  await saveSubscriptions();
+
+  return {
+    changed: previousSourceSha !== source.sha || Object.keys(requestedValues).length > 0,
+    sourceSha: source.sha,
+    newKeys: sync.newKeys,
+    addedKeys: Object.keys(requestedValues),
+    deploymentUrl: deployment.url,
+    backupRef: sync.backupRef,
+  };
+}
+
+async function productRevert(subscription) {
+  await ensureSubscriptionRepository(subscription);
+  if (!subscription.backupRef) throw new Error('There is no saved update available to revert.');
+  const repository = {
+    owner: subscription.owner,
+    repo: subscription.repo,
+    repoId: subscription.repoId,
+    branch: subscription.branch,
+    htmlUrl: subscription.htmlUrl,
+    vercelProjectId: subscription.vercelProjectId,
+  };
+  const reverted = await revertRepository(repository, subscription.backupRef);
+  const deployment = await deployRepository(repository);
+  subscription.lastAppliedAt = new Date().toISOString();
+  subscription.lastError = '';
+  subscription.lastReason = 'revert';
+  subscription.vercelProjectId = deployment.projectId || subscription.vercelProjectId || '';
+  subscription.vercelDeploymentId = deployment.deploymentId || '';
+  subscription.lastDeploymentUrl = deployment.url || subscription.lastDeploymentUrl || '';
+  subscription.backupRef = '';
+  subscription.previousSha = reverted.sha;
+  await saveSubscriptions();
+  return { deploymentUrl: deployment.url, sha: reverted.sha };
+}
+
+async function notifyProductUpdate(subscription, result, automatic = false) {
+  if (!subscription.chatId) return;
+  if (result.newKeys?.length) {
+    await telegramSend(
+      subscription.chatId,
+      `${automatic ? 'A new source update was applied automatically.' : 'A source update is available.'}\n\n` +
+        `New configuration values: ${result.newKeys.join(', ')}\n` +
+        'Press Add Now to add the source defaults, or Update Now to keep the new code without adding them yet.',
+      [['Add Now', 'Update Now'], ['Revert Last Update'], ['My Product']],
+    );
+  } else {
+    await telegramSend(
+      subscription.chatId,
+      `${automatic ? 'Auto-update complete.' : 'Update complete.'}\n${result.deploymentUrl || ''}`,
+      [['My Product'], ['Revert Last Update']],
+    );
+  }
+}
+
+async function runProductJob(job, subscription, action, options = {}) {
+  try {
+    job.status = 'running';
+    job.stage = action === 'revert' ? 'reverting' : 'updating';
+    job.updatedAt = new Date().toISOString();
+    const result = action === 'revert'
+      ? await productRevert(subscription)
+      : await productUpdate(subscription, options);
+    job.status = 'ready';
+    job.stage = 'complete';
+    job.result = result;
+    job.updatedAt = new Date().toISOString();
+    await notifyProductUpdate(subscription, result, Boolean(options.automatic));
+  } catch (error) {
+    subscription.lastError = safeError(error);
+    await saveSubscriptions().catch(() => {});
+    job.status = 'failed';
+    job.stage = 'failed';
+    job.error = safeError(error);
+    job.updatedAt = new Date().toISOString();
+    if (subscription.chatId) {
+      await telegramSend(
+        subscription.chatId,
+        `Product update failed: ${subscription.lastError}`,
+        [['My Product'], ['Check Updates']],
+      ).catch(() => {});
+    }
+  } finally {
+    subscription.activeJobId = '';
+    await saveSubscriptions().catch(() => {});
+  }
+}
+
+function startProductJob(subscription, action, options = {}) {
+  if (subscription.activeJobId) {
+    const existing = productJobs.get(subscription.activeJobId);
+    if (existing) return existing;
+  }
+  const job = {
+    id: randomUUID(),
+    productId: subscription.id,
+    action,
+    status: 'queued',
+    stage: 'queued',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  productJobs.set(job.id, job);
+  subscription.activeJobId = job.id;
+  void runProductJob(job, subscription, action, options);
+  return job;
+}
+
+async function pollProductUpdates() {
+  if (updatePollRunning) return;
+  updatePollRunning = true;
+  try {
+    await loadSubscriptions();
+    const source = await readSourceSnapshot();
+    const now = Date.now();
+    for (const subscription of subscriptions.values()) {
+      if (subscription.scheduledFor && Number(subscription.scheduledFor) <= now) {
+        subscription.scheduledFor = '';
+        startProductJob(subscription, 'update', { reason: 'scheduled' });
+      }
+      if (!subscription.autoUpdate || subscription.activeJobId) continue;
+      if (subscription.sourceSha && subscription.sourceSha !== source.sha) {
+        startProductJob(subscription, 'update', { automatic: true, reason: 'automatic' });
+      } else if (!subscription.sourceSha) {
+        subscription.sourceSha = source.sha;
+      }
+    }
+    await saveSubscriptions();
+  } catch (error) {
+    console.error(`[backend] product update poll failed: ${safeError(error)}`);
+  } finally {
+    updatePollRunning = false;
+  }
 }
 
 async function deleteHostedResources({ vercelProjectId, repository }) {
@@ -615,6 +1119,103 @@ async function handle(req, res) {
     return json(res, 202, { ok: true, build: publicJob(job) });
   }
 
+  if (req.method === 'POST' && parsed.pathname === '/v1/config/import') {
+    const text = await readTelegramDocument(body.fileId);
+    const parsedConfig = parseConfigUpload(text);
+    return json(res, 200, { ok: true, updates: parsedConfig.updates, invalid: parsedConfig.invalid });
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/v1/products/register') {
+    await loadSubscriptions();
+    const id = subscriptionId(body);
+    const existing = subscriptions.get(id) || {};
+    const subscription = {
+      ...existing,
+      id,
+      userId: String(body.userId || existing.userId || ''),
+      chatId: String(body.chatId || existing.chatId || body.userId || ''),
+      projectName: String(body.projectName || existing.projectName || 'Website'),
+      repository: String(body.repository || existing.repository || ''),
+      branch: String(body.branch || existing.branch || SOURCE_BRANCH),
+      repoId: body.repoId || existing.repoId || '',
+      htmlUrl: String(body.htmlUrl || existing.htmlUrl || body.repository || ''),
+      vercelProjectId: String(body.vercelProjectId || existing.vercelProjectId || ''),
+      autoUpdate: body.autoUpdate === undefined ? Boolean(existing.autoUpdate) : Boolean(body.autoUpdate),
+      pendingConfigKeys: existing.pendingConfigKeys || [],
+      sourceSha: existing.sourceSha || '',
+      lastAppliedAt: existing.lastAppliedAt || null,
+      scheduledFor: existing.scheduledFor || '',
+      backupRef: existing.backupRef || '',
+      activeJobId: existing.activeJobId || '',
+      lastError: '',
+    };
+    await ensureSubscriptionRepository(subscription);
+    if (!subscription.sourceSha) {
+      const source = await readSourceSnapshot();
+      subscription.sourceSha = source.sha;
+    }
+    subscriptions.set(id, subscription);
+    await saveSubscriptions();
+    return json(res, 200, { ok: true, product: publicSubscription(subscription) });
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/v1/products/settings') {
+    await loadSubscriptions();
+    const id = subscriptionId(body);
+    const subscription = subscriptions.get(id);
+    if (!subscription) return json(res, 404, { ok: false, error: 'Product is not registered.' });
+    if (body.autoUpdate !== undefined) subscription.autoUpdate = Boolean(body.autoUpdate);
+    if (body.scheduledFor !== undefined) subscription.scheduledFor = body.scheduledFor || '';
+    await saveSubscriptions();
+    return json(res, 200, { ok: true, product: publicSubscription(subscription) });
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/v1/products/check') {
+    await loadSubscriptions();
+    const id = subscriptionId(body);
+    const subscription = subscriptions.get(id);
+    if (!subscription) return json(res, 404, { ok: false, error: 'Product is not registered.' });
+    await ensureSubscriptionRepository(subscription);
+    const source = await readSourceSnapshot();
+    const target = await readConfig(TARGET_TOKEN, subscription.owner, subscription.repo, subscription.branch);
+    const targetKeys = new Set(configKeysFrom(target.text));
+    const newKeys = source.configKeys.filter((key) => !targetKeys.has(key));
+    const changed = Boolean(subscription.sourceSha && subscription.sourceSha !== source.sha);
+    subscription.pendingConfigKeys = newKeys;
+    await saveSubscriptions();
+    return json(res, 200, {
+      ok: true,
+      changed,
+      sourceSha: source.sha,
+      currentSourceSha: subscription.sourceSha || null,
+      newKeys,
+      autoUpdate: Boolean(subscription.autoUpdate),
+      scheduledFor: subscription.scheduledFor || null,
+    });
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/v1/products/update') {
+    await loadSubscriptions();
+    const id = subscriptionId(body);
+    const subscription = subscriptions.get(id);
+    if (!subscription) return json(res, 404, { ok: false, error: 'Product is not registered.' });
+    const action = body.action === 'revert' ? 'revert' : 'update';
+    const job = startProductJob(subscription, action, {
+      addNewKeys: Boolean(body.addNewKeys),
+      configValues: body.configValues || {},
+      reason: body.reason || 'manual',
+    });
+    await saveSubscriptions();
+    return json(res, 202, { ok: true, job: { id: job.id, status: job.status, stage: job.stage } });
+  }
+
+  const productJobMatch = parsed.pathname.match(/^\/v1\/products\/updates\/([^/]+)$/);
+  if (req.method === 'GET' && productJobMatch) {
+    const job = productJobs.get(productJobMatch[1]);
+    if (!job) return json(res, 404, { ok: false, error: 'Product update job not found.' });
+    return json(res, 200, { ok: true, job });
+  }
+
   if (req.method === 'POST' && parsed.pathname === '/v1/products/delete') {
     const result = await deleteHostedResources({
       vercelProjectId: body.vercelProjectId,
@@ -666,6 +1267,10 @@ const server = await import('node:http').then(({ createServer }) =>
 
 server.listen(PORT, HOST, () => {
   console.log(`Builder backend listening on ${HOST}:${PORT}`);
+  void loadSubscriptions().then(() => pollProductUpdates());
+  setInterval(() => {
+    void pollProductUpdates();
+  }, UPDATE_POLL_MS);
   const endpoint = publicBaseUrl();
   void updateDiscoveryFile().catch((error) => {
     console.error(`[backend] discovery update failed: ${safeError(error)}`);

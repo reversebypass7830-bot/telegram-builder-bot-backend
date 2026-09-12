@@ -32,11 +32,13 @@ process.stdout.write(value);
 NODE
 }
 
-backend_key="${BUILDER_BACKEND_API_KEY:-${SESSION_SECRET:-$(config_value BUILDER_BACKEND_API_KEY)}}"
+backend_key="${BUILDER_BACKEND_API_KEY:-$(config_value BUILDER_BACKEND_API_KEY)}"
 backend_key="${backend_key:-$(config_value Secret_key)}"
+backend_key="${backend_key:-${SESSION_SECRET:-}}"
 source_token="${BUILDER_GITHUB_SOURCE_TOKEN:-$(config_value BUILDER_GITHUB_SOURCE_TOKEN)}"
 target_token="${BUILDER_GITHUB_TARGET_TOKEN:-$(config_value BUILDER_GITHUB_TARGET_TOKEN)}"
 vercel_token="${BUILDER_VERCEL_TOKEN:-$(config_value BUILDER_VERCEL_TOKEN)}"
+telegram_token="${BUILDER_BOT_TELEGRAM_TOKEN:-$(config_value BUILDER_BOT_TELEGRAM_TOKEN)}"
 telebothost_key="${BUILDER_TELEBOTHOST_API_KEY:-$(config_value BUILDER_TELEBOTHOST_API_KEY)}"
 telebothost_key="${telebothost_key:-$(config_value Secret_key)}"
 
@@ -44,7 +46,8 @@ for pair in \
   "BUILDER_BACKEND_API_KEY:${backend_key}" \
   "BUILDER_GITHUB_SOURCE_TOKEN:${source_token}" \
   "BUILDER_GITHUB_TARGET_TOKEN:${target_token}" \
-  "BUILDER_VERCEL_TOKEN:${vercel_token}"; do
+  "BUILDER_VERCEL_TOKEN:${vercel_token}" \
+  "BUILDER_BOT_TELEGRAM_TOKEN:${telegram_token}"; do
   name="${pair%%:*}"
   value="${pair#*:}"
   if [ -z "$value" ]; then
